@@ -3297,6 +3297,74 @@ class TestVerifyReq(unittest.TestCase):
             self.tracker.update_done_task_count("never_seen")
         self.assertTrue(any(o.startswith("WARNING:") and "never_seen" in o for o in cm.output))
 
+    def _start_sending_thread(self):
+        ready_event = threading.Event()
+        metadata = make_agent_metadata(engine_id="engine1", kv_caches_base_addr=[[12345678]], num_blocks=2)
+        host = "127.0.0.1"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            base_port = s.getsockname()[1]
+        thread = KVCacheSendingThread(
+            tp_rank=0,
+            prefill_tp_size=1,
+            local_engine_id="engine1",
+            side_channel_host=host,
+            side_channel_port=base_port,
+            metadata=metadata,
+            vllm_config=MockVllmConfig(),
+            ready_event=ready_event,
+            kv_caches={},
+            pcp_rank=0,
+        )
+        thread.start()
+        actual_port = base_port + (
+            thread.pp_rank * thread.tp_size + thread.tp_rank + thread.pcp_rank * thread.prefill_tp_size
+        )
+        self.assertTrue(ready_event.wait(timeout=3), "Server thread startup timeout")
+        context = zmq.Context()
+        sock = context.socket(zmq.DEALER)
+        sock.setsockopt(zmq.RCVTIMEO, 1000)
+        sock.connect(f"tcp://{host}:{actual_port}")
+        return thread, sock, actual_port
+
+    def _verify_roundtrip(self, sock, transfer_id):
+        encoder = msgspec.msgpack.Encoder()
+        decoder = msgspec.msgpack.Decoder(type=tuple)
+        sock.send_multipart([b"", encoder.encode((VERIFY_REQ_MSG, transfer_id))])
+        frames = sock.recv_multipart()
+        self.assertEqual(frames[0], b"")
+        return decoder.decode(frames[1])
+
+    def test_run_busy_loop_verify_valid(self):
+        thread, sock, _ = self._start_sending_thread()
+        try:
+            thread.task_tracker.add_req_to_process("p_req_1")
+            thread.task_tracker.add_delayed_request("p_req_1", time.time())
+            msg = self._verify_roundtrip(sock, "p_req_1")
+            self.assertEqual(msg[0], VERIFY_RESP_MSG)
+            self.assertEqual(msg[1], VERIFY_STATUS_VALID)
+        finally:
+            sock.close()
+
+    def test_run_busy_loop_verify_expired(self):
+        thread, sock, _ = self._start_sending_thread()
+        try:
+            msg = self._verify_roundtrip(sock, "p_req_gone")
+            self.assertEqual(msg[0], VERIFY_RESP_MSG)
+            self.assertEqual(msg[1], VERIFY_STATUS_EXPIRED)
+        finally:
+            sock.close()
+
+    def test_run_busy_loop_verify_malformed_no_reply(self):
+        thread, sock, _ = self._start_sending_thread()
+        try:
+            encoder = msgspec.msgpack.Encoder()
+            sock.send_multipart([b"", encoder.encode((VERIFY_REQ_MSG, 12345))])  # 非 str payload
+            with self.assertRaises(zmq.Again):
+                sock.recv_multipart()  # 不回包 → D 侧按超时降级
+        finally:
+            sock.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -434,6 +434,24 @@ class KVCacheSendingThread(threading.Thread):
                             # If the socket is not ready, retry sending.
                             logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
+                elif msg[0] == VERIFY_REQ_MSG:
+                    # Passive handler: always answered regardless of the
+                    # D-side VLLM_ASCEND_VERIFY_KV_BEFORE_PULL switch. Keep
+                    # the critical section O(1) — all state access goes
+                    # through check_and_extend under done_task_lock.
+                    if len(msg) != 2 or not isinstance(msg[1], str):
+                        logger.error(
+                            "Invalid VERIFY_REQ_MSG payload. "
+                            "Expected: (VERIFY_REQ_MSG, str transfer_id). "
+                            "Actual: %s.",
+                            msg,
+                        )
+                    else:
+                        is_valid = self.task_tracker.check_and_extend(msg[1])
+                        resp_payload = encoder.encode(
+                            (VERIFY_RESP_MSG, VERIFY_STATUS_VALID if is_valid else VERIFY_STATUS_EXPIRED)
+                        )
+                        sock.send_multipart((identity, b"", resp_payload))
                 else:
                     logger.error(
                         "Connection listener received unexpected message type. "
