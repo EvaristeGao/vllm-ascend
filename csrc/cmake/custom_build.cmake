@@ -238,6 +238,11 @@ if (BUILD_OPEN_PROJECT)
     )
 
     if(ADD_OPS_COMPILE_OPTION_V2)
+        # 高版本 gcc/glibc 有 bug，昇腾的编译器不认识 /usr/include/bits/floatn.h 里面的 float128，这里我们伪装成 sycl，走不认识 float128 的 case，防止报错 
+        list(APPEND OPS_COMPILE_OPTIONS
+        "-D__INTEL_LLVM_COMPILER=20250000"
+        "-DSYCL_LANGUAGE_VERSION=202001"
+        )
         add_ops_compile_options(
                 OP_NAME "ALL"
                 OPTIONS ${OPS_COMPILE_OPTIONS}

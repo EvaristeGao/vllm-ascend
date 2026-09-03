@@ -74,7 +74,7 @@ else
     DEFAULT_INSTALL_DIR="/usr/local/Ascend/latest"
 fi
 CANN_3RD_LIB_PATH="${CURRENT_DIR}/third_party"
-CUSTOM_OPTION="-DBUILD_OPEN_PROJECT=ON"
+CUSTOM_OPTION="-DBUILD_OPEN_PROJECT=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
 
 dotted_line="---------------------------------------------------------------------------------------------------------------------"
 ########################################################################################################################

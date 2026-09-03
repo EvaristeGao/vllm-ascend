@@ -33,6 +33,18 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+[[tool.uv.index]]
+name = "common"
+url = "https://mirrors.bfsu.edu.cn/pypi/web/simple/"
+
+[[tool.uv.index]]
+name = "torch-cpu"
+url = "https://download.pytorch.org/whl/cpu/"
+
+[[tool.uv.index]]
+name = "ascend"
+url = "https://mirrors.huaweicloud.com/ascend/repos/pypi"
+
 [tool.uv.extra-build-dependencies]
 pandas = ["setuptools<72"]
 

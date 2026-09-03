@@ -366,6 +366,8 @@ class cmake_build_ext(build_ext):
         )
 
     def build_extensions(self) -> None:
+        self.build_temp = os.path.join(ROOT_DIR, "build", "cmake")
+
         if not envs.COMPILE_CUSTOM_KERNELS:
             return
         # Ensure that CMake is present and working
