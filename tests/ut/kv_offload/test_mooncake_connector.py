@@ -3261,6 +3261,24 @@ class TestVerifyReq(unittest.TestCase):
         with patch("time.time", return_value=start + VERIFY_GRACE_SECONDS + 0.1):
             self.assertEqual(self.tracker._retrieve_expired_requests(), {"req_1"})
 
+    def test_force_free_not_shielded_by_extended_entry(self):
+        timeout = vllm_envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+        start = time.time()
+        # A 先入典：剩余 1s；verify 后 deadline 顶到 start + G=10s
+        self._add_held_request("req_A", start - (timeout - 1.0))
+        # B 后入典：剩余 2s（插入更晚、原本过期更晚，但早于 A 的新 deadline）
+        self._add_held_request("req_B", start - (timeout - 2.0))
+        with patch("time.time", return_value=start):
+            self.assertTrue(self.tracker.check_and_extend("req_A"))
+        # t=start+3：B 已过期（3>2）、A 未过期（3<10）——B 必须被弹出，不被 A 遮挡
+        with patch("time.time", return_value=start + 3.0):
+            self.assertEqual(self.tracker._retrieve_expired_requests(), {"req_B"})
+        self.assertIn("req_A", self.tracker.delayed_free_requests)
+        self.assertIn("req_B", self.tracker.recently_force_freed)
+        # t=start+11：A 也过期
+        with patch("time.time", return_value=start + VERIFY_GRACE_SECONDS + 1.0):
+            self.assertEqual(self.tracker._retrieve_expired_requests(), {"req_A"})
+
     def test_done_after_force_free_is_debug(self):
         # mooncake_connector 使用 vllm 共享 logger（名为 "vllm.logger"），
         # 记录向 "vllm" 祖先传播，因此 assertLogs 挂在 "vllm" 上。

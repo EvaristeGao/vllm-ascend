@@ -269,13 +269,14 @@ class KVCacheTaskTracker:
     def _retrieve_expired_requests(self):
         """Retrieve all expired delayed requests."""
         expired_requests: set[str] = set()
-        # Free delayed requests if they exceed the timeout
+        # Free delayed requests if they exceed the timeout. check_and_extend
+        # may push an entry's deadline past that of entries inserted after it,
+        # so insertion order no longer implies deadline order: scan the whole
+        # map instead of stopping at the first live entry.
         current_time = time.time()
-        while self.delayed_free_requests:
-            request_id = next(iter(self.delayed_free_requests))
-            delay_start_time = self.delayed_free_requests[request_id]
+        for request_id, delay_start_time in list(self.delayed_free_requests.items()):
             if current_time - delay_start_time > envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:
-                self.delayed_free_requests.popitem(last=False)
+                self.delayed_free_requests.pop(request_id)
                 self.reqs_to_process.discard(request_id)
                 expired_requests.add(request_id)
                 self.recently_force_freed[request_id] = current_time
@@ -288,8 +289,6 @@ class KVCacheTaskTracker:
                     request_id,
                     envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
                 )
-            else:
-                break
         return expired_requests
 
 
