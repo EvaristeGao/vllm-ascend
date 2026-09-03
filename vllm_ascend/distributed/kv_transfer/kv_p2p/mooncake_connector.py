@@ -191,6 +191,10 @@ class KVCacheTaskTracker:
         # be force-freed.
         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
         self.reqs_to_process: set[str] = set()
+        # Short-lived bookkeeping of force-freed request ids. A late
+        # DONE_RECVING for these is expected (the D side skipped the pull after
+        # a failed verify) and is logged at debug instead of warning.
+        self.recently_force_freed: OrderedDict[str, float] = OrderedDict()
 
     def add_req_to_process(self, request_id: str):
         self.reqs_to_process.add(request_id)
@@ -207,13 +211,21 @@ class KVCacheTaskTracker:
                 self.reqs_to_process.discard(request_id)
                 self.delayed_free_requests.pop(request_id, None)
             else:
-                logger.warning(
-                    "MooncakeConnector finish req not in reqs to process. "
-                    "request_id=%s. "
-                    "Possible cause: Request was already completed or not properly tracked. "
-                    "Check: Verify request lifecycle and tracking logic.",
-                    request_id,
-                )
+                if self.recently_force_freed.pop(request_id, None) is not None:
+                    logger.debug(
+                        "MooncakeConnector received late DONE_RECVING after "
+                        "force-free (expected after a failed VERIFY). "
+                        "request_id=%s.",
+                        request_id,
+                    )
+                else:
+                    logger.warning(
+                        "MooncakeConnector finish req not in reqs to process. "
+                        "request_id=%s. "
+                        "Possible cause: Request was already completed or not properly tracked. "
+                        "Check: Verify request lifecycle and tracking logic.",
+                        request_id,
+                    )
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -234,6 +246,26 @@ class KVCacheTaskTracker:
             if request_id in self.reqs_to_process:
                 self.delayed_free_requests[request_id] = delay_start_time
 
+    def check_and_extend(self, request_id: str) -> bool:
+        """Verify a request's blocks are still held and extend its deadline.
+
+        Returns False when the request has been released (force-freed or done),
+        True otherwise. Extension applies the VERIFY grace floor: the remaining
+        delayed-free lifetime is topped up to VERIFY_GRACE_SECONDS and never
+        shortened. Only entries already in delayed_free_requests are touched —
+        a request tracked but not yet delayed-freed cannot be force-freed.
+        """
+        with self.done_task_lock:
+            if request_id not in self.reqs_to_process:
+                return False
+            if request_id in self.delayed_free_requests:
+                deadline_floor = time.time() - (
+                    envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT - VERIFY_GRACE_SECONDS
+                )
+                if deadline_floor > self.delayed_free_requests[request_id]:
+                    self.delayed_free_requests[request_id] = deadline_floor
+            return True
+
     def _retrieve_expired_requests(self):
         """Retrieve all expired delayed requests."""
         expired_requests: set[str] = set()
@@ -246,6 +278,9 @@ class KVCacheTaskTracker:
                 self.delayed_free_requests.popitem(last=False)
                 self.reqs_to_process.discard(request_id)
                 expired_requests.add(request_id)
+                self.recently_force_freed[request_id] = current_time
+                if len(self.recently_force_freed) > MAX_RECENTLY_FORCE_FREED:
+                    self.recently_force_freed.popitem(last=False)
                 logger.error(
                     "Force freed expired request: %s. "
                     "Reason: Request exceeded timeout threshold (%s seconds). "

@@ -3200,6 +3200,85 @@ class TestVerifyReq(unittest.TestCase):
         with patch.dict(os.environ, {"VLLM_ASCEND_VERIFY_KV_BEFORE_PULL": "1"}):
             self.assertTrue(ascend_envs.VLLM_ASCEND_VERIFY_KV_BEFORE_PULL)
 
+    def setUp(self):
+        self.tracker = KVCacheTaskTracker()
+
+    def _add_held_request(self, request_id: str, delay_start_time: float):
+        self.tracker.add_req_to_process(request_id)
+        self.tracker.add_delayed_request(request_id, delay_start_time)
+
+    def test_check_and_extend_valid(self):
+        self._add_held_request("req_1", time.time())
+        self.assertTrue(self.tracker.check_and_extend("req_1"))
+
+    def test_check_and_extend_after_force_free(self):
+        self._add_held_request("req_1", time.time() - 10**6)
+        self.tracker.get_and_clear_finished_requests()  # 触发 force-free
+        self.assertFalse(self.tracker.check_and_extend("req_1"))
+
+    def test_check_and_extend_after_done(self):
+        self._add_held_request("req_1", time.time())
+        self.tracker.update_done_task_count("req_1")
+        self.assertFalse(self.tracker.check_and_extend("req_1"))
+
+    def test_check_and_extend_unknown_request(self):
+        self.assertFalse(self.tracker.check_and_extend("ghost"))
+
+    def test_verify_extends_deadline(self):
+        timeout = vllm_envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+        start = time.time()
+        # 剩余仅 1s：< G=10s，应被顶到 G
+        self._add_held_request("req_1", start - (timeout - 1.0))
+        with patch("time.time", return_value=start):
+            self.assertTrue(self.tracker.check_and_extend("req_1"))
+        deadline = self.tracker.delayed_free_requests["req_1"]
+        remaining = deadline + timeout - start
+        self.assertAlmostEqual(remaining, VERIFY_GRACE_SECONDS, delta=0.5)
+
+    def test_verify_never_shortens_window(self):
+        start = time.time()
+        self._add_held_request("req_1", start)  # 剩余 ~480s ≥ G：值必须不动
+        value_before = self.tracker.delayed_free_requests["req_1"]
+        self.assertTrue(self.tracker.check_and_extend("req_1"))
+        self.assertEqual(self.tracker.delayed_free_requests["req_1"], value_before)
+
+    def test_check_and_extend_does_not_create_entry(self):
+        # 在 reqs_to_process 但尚未进入延迟释放（不可能被 force-free）：不凭空建条目
+        self.tracker.add_req_to_process("req_1")
+        self.assertTrue(self.tracker.check_and_extend("req_1"))
+        self.assertNotIn("req_1", self.tracker.delayed_free_requests)
+
+    def test_grace_boundary_with_injected_clock(self):
+        timeout = vllm_envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+        start = time.time()
+        self._add_held_request("req_1", start - (timeout - 1.0))
+        with patch("time.time", return_value=start):
+            self.assertTrue(self.tracker.check_and_extend("req_1"))
+        # G - ε：仍存活（竞态关闭的确定性证明）
+        with patch("time.time", return_value=start + VERIFY_GRACE_SECONDS - 0.1):
+            self.assertEqual(self.tracker._retrieve_expired_requests(), set())
+        # G + ε：已过期并被 force-free
+        with patch("time.time", return_value=start + VERIFY_GRACE_SECONDS + 0.1):
+            self.assertEqual(self.tracker._retrieve_expired_requests(), {"req_1"})
+
+    def test_done_after_force_free_is_debug(self):
+        # mooncake_connector 使用 vllm 共享 logger（名为 "vllm.logger"），
+        # 记录向 "vllm" 祖先传播，因此 assertLogs 挂在 "vllm" 上。
+        logger_name = "vllm"
+        self._add_held_request("req_1", time.time() - 10**6)
+        self.tracker.get_and_clear_finished_requests()
+        self.assertIn("req_1", self.tracker.recently_force_freed)
+        with self.assertLogs(logger_name, level="DEBUG") as cm:
+            self.tracker.update_done_task_count("req_1")
+        self.assertTrue(any(o.startswith("DEBUG:") and "force-free" in o for o in cm.output))
+        self.assertNotIn("req_1", self.tracker.recently_force_freed)
+
+    def test_done_for_unknown_request_still_warning(self):
+        logger_name = "vllm"
+        with self.assertLogs(logger_name, level="WARNING") as cm:
+            self.tracker.update_done_task_count("never_seen")
+        self.assertTrue(any(o.startswith("WARNING:") and "never_seen" in o for o in cm.output))
+
 
 if __name__ == "__main__":
     unittest.main()
