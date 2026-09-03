@@ -865,6 +865,17 @@ class KVCacheRecvingThread(threading.Thread):
         if num_local_blocks == 0 and not has_replicate_k_blocks:
             return
 
+        # Verify the remote blocks are still held before the one-sided read
+        # (issue #15420). Zero-block (full prefix hit) requests never read and
+        # skip this. A failed verify raises and is converted to the existing
+        # failed-recv path by _handle_request's except clause.
+        if self.verify_before_pull_enabled and not self._verify_remote_blocks_held(req_meta):
+            raise KVCacheVerifyExpiredError(
+                f"Remote KV blocks expired on P side before pull. "
+                f"remote_request_id={remote_request_id}, "
+                f"source={remote_host}:{remote_handshake_port}"
+            )
+
         # Check if we have the remote metadata cached.
         with self.remote_metadata_lock:
             has_remote_metadata = (

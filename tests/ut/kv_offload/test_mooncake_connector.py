@@ -3468,6 +3468,69 @@ class TestVerifyReq(unittest.TestCase):
             thread._record_verify_stat("valid")
         mock_record.assert_called_once_with("valid")
 
+    def _prepare_remote_metadata(self, thread: KVCacheRecvingThread):
+        thread.kv_caches_base_addr["remote_engine"][7777] = [[111]]
+        thread.kv_caches_base_addr["local_engine"][5555] = [[0x1000]]
+        thread.remote_te_port["remote_engine"][7777] = 8888
+        thread.remote_block_stride_per_addr["remote_engine"][7777] = [[64]]
+        # 预置连接池，使走真实 _verify_remote_blocks_held 的用例不再创建真实
+        # zmq Context/Socket：空闲 context 被 GC 时 ctx.term() 可能阻塞
+        # （在等已泄露的后台线程释放 socket），卡死整个全文件 UT 进程。
+        thread.remote_sockets[make_zmq_path("tcp", "10.0.0.1", 7777)] = deque([MagicMock()])
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
+    def test_transfer_verify_pass_continues(self, mock_send, mock_recv):
+        thread = self._make_recv_thread()
+        self._prepare_remote_metadata(thread)
+        mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_VALID))
+        req_meta = self._make_req_meta()
+        # group_pulls=[] → 通过校验后构建 src_list 为空 → 干净返回，不发起读
+        thread._transfer_kv_cache_all_groups(req_meta)
+        self.assertEqual(thread.verify_stats["valid"], 1)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
+    def test_transfer_verify_expired_raises(self, mock_send, mock_recv):
+        thread = self._make_recv_thread()
+        self._prepare_remote_metadata(thread)
+        mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_EXPIRED))
+        with self.assertRaises(KVCacheVerifyExpiredError):
+            thread._transfer_kv_cache_all_groups(self._make_req_meta())
+        self.assertEqual(thread.verify_stats["expired"], 1)
+
+    def test_transfer_verify_expired_skips_engine_read(self):
+        thread = self._make_recv_thread()
+        self._prepare_remote_metadata(thread)
+        with patch.object(thread, "_verify_remote_blocks_held", return_value=False):
+            with self.assertRaises(KVCacheVerifyExpiredError):
+                thread._transfer_kv_cache_all_groups(self._make_req_meta())
+        thread.engine.batch_transfer_sync_read.assert_not_called()
+
+    def test_transfer_verify_enabled_skips_when_zero_blocks(self):
+        thread = self._make_recv_thread()
+        req_meta = self._make_req_meta()
+        req_meta["local_block_ids"] = [[]]  # full prefix hit：零块早退
+        with patch.object(thread, "_verify_remote_blocks_held") as mock_verify:
+            thread._transfer_kv_cache_all_groups(req_meta)
+        mock_verify.assert_not_called()
+
+    def test_handle_request_expired_marks_failed(self):
+        thread = self._make_recv_thread()
+        self._prepare_remote_metadata(thread)
+        thread.task_tracker.add_req_to_process("d_req_1")
+        thread.request_queue.put({"request_id": "d_req_1"})
+        req_meta = self._make_req_meta()
+        with (
+            patch.object(thread, "_verify_remote_blocks_held", return_value=False),
+            patch.object(thread, "_send_done_recv_signal"),
+            patch.object(thread, "_send_done_signal_to_free_remote_port"),
+        ):
+            thread._handle_request(req_meta)  # 不得抛出：异常在 except 中转为 failed-recv
+        self.assertEqual(thread.invalid_block_ids, {101, 102})
+        self.assertIn("d_req_1", thread.task_tracker.finished_requests)
+        thread.engine.batch_transfer_sync_read.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
