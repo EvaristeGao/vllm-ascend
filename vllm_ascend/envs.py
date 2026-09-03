@@ -110,6 +110,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether the decode (kv_consumer) node verifies with the prefill node via a
+    # ZMQ VERIFY_REQ message that the remote KV blocks are still held, before
+    # issuing the one-sided KV pull. Prevents dirty/stale KV reads when the
+    # prefill node force-freed timed-out blocks (vllm-ascend issue #15420).
+    # Default off. The P-side VERIFY_REQ handler is unconditional.
+    "VLLM_ASCEND_VERIFY_KV_BEFORE_PULL": lambda: bool(int(os.getenv("VLLM_ASCEND_VERIFY_KV_BEFORE_PULL", "0"))),
 }
 
 # end-env-vars-definition

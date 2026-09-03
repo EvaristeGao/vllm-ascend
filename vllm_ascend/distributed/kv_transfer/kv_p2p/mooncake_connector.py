@@ -81,6 +81,22 @@ if TYPE_CHECKING:
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
 
+VERIFY_REQ_MSG = b"verify_req_msg"
+VERIFY_RESP_MSG = b"verify_resp_msg"
+VERIFY_STATUS_VALID = b"VALID"
+VERIFY_STATUS_EXPIRED = b"EXPIRED"
+# Deadline floor granted by a successful VERIFY: the request's remaining
+# delayed-free lifetime is topped up to this many seconds (never shortened).
+VERIFY_GRACE_SECONDS = 10
+VERIFY_STATS_SUMMARY_INTERVAL_SECONDS = 60
+# Upper bound for the short-lived recently_force_freed bookkeeping (P side).
+MAX_RECENTLY_FORCE_FREED = 1024
+
+
+class KVCacheVerifyExpiredError(Exception):
+    """Raised on the D side when the P side reports (or verify cannot confirm)
+    that the remote KV blocks for a request are no longer held."""
+
 
 # A busy peer can otherwise keep a global executor worker forever when the
 # number of peers is larger than max_workers. Yield after a small FIFO batch so

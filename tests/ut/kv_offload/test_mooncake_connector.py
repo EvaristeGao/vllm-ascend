@@ -13,9 +13,12 @@ from unittest.mock import MagicMock, patch
 import msgspec
 import torch
 import zmq
+from vllm import envs as vllm_envs  # noqa: F401
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, UniformTypeKVCacheSpecs
 from vllm.v1.request import RequestStatus
+
+from vllm_ascend import envs as ascend_envs
 
 fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
@@ -59,10 +62,16 @@ patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
     MAX_REQUESTS_PER_PEER_HANDLER,
+    VERIFY_GRACE_SECONDS,
+    VERIFY_REQ_MSG,
+    VERIFY_RESP_MSG,
+    VERIFY_STATUS_EXPIRED,
+    VERIFY_STATUS_VALID,
     GroupPull,
     KVCacheRecvingThread,
     KVCacheSendingThread,
     KVCacheTaskTracker,
+    KVCacheVerifyExpiredError,
     KVConnectorRole,
     MooncakeAgentMetadata,
     MooncakeConnector,
@@ -3166,6 +3175,30 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
 
         with self.assertRaises(AssertionError):
             worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
+
+
+class TestVerifyReq(unittest.TestCase):
+    """VERIFY_REQ Phase 1 单元测试（规格 §8）。"""
+
+    def test_message_constants(self):
+        self.assertEqual(VERIFY_REQ_MSG, b"verify_req_msg")
+        self.assertEqual(VERIFY_RESP_MSG, b"verify_resp_msg")
+        self.assertEqual(VERIFY_STATUS_VALID, b"VALID")
+        self.assertEqual(VERIFY_STATUS_EXPIRED, b"EXPIRED")
+        self.assertEqual(VERIFY_GRACE_SECONDS, 10)
+
+    def test_verify_expired_error_is_exception(self):
+        err = KVCacheVerifyExpiredError("p_req_1 expired")
+        self.assertIsInstance(err, Exception)
+        self.assertIn("p_req_1", str(err))
+
+    def test_env_switch_default_off(self):
+        with patch.dict(os.environ, {"VLLM_ASCEND_VERIFY_KV_BEFORE_PULL": "0"}):
+            self.assertFalse(ascend_envs.VLLM_ASCEND_VERIFY_KV_BEFORE_PULL)
+
+    def test_env_switch_enable(self):
+        with patch.dict(os.environ, {"VLLM_ASCEND_VERIFY_KV_BEFORE_PULL": "1"}):
+            self.assertTrue(ascend_envs.VLLM_ASCEND_VERIFY_KV_BEFORE_PULL)
 
 
 if __name__ == "__main__":
