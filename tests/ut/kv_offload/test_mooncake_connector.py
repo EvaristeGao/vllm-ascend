@@ -3531,6 +3531,21 @@ class TestVerifyReq(unittest.TestCase):
         self.assertIn("d_req_1", thread.task_tracker.finished_requests)
         thread.engine.batch_transfer_sync_read.assert_not_called()
 
+    def test_zmq_verify_roundtrip_end_to_end(self):
+        thread_p, _unused_sock, actual_port = self._start_sending_thread()
+        thread_p.task_tracker.add_req_to_process("p_req_live")
+        thread_p.task_tracker.add_delayed_request("p_req_live", time.time())
+        thread_d = self._make_recv_thread()
+        for transfer_id, expect_held in (("p_req_live", True), ("p_req_gone", False)):
+            req_meta = self._make_req_meta()
+            req_meta["remote_request_id"] = transfer_id
+            req_meta["remote_host"] = "127.0.0.1"
+            req_meta["remote_handshake_port"] = actual_port
+            held = thread_d._verify_remote_blocks_held(req_meta)
+            self.assertEqual(held, expect_held)
+        self.assertEqual(thread_d.verify_stats["valid"], 1)
+        self.assertEqual(thread_d.verify_stats["expired"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
