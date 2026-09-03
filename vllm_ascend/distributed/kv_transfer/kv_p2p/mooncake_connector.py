@@ -572,6 +572,14 @@ class KVCacheRecvingThread(threading.Thread):
         )
         self.timeout = 1.0  # seconds
 
+        # VERIFY before pull (issue #15420). Read once at startup — the hot
+        # path must not hit the env lookup.
+        self.verify_before_pull_enabled = ascend_envs.VLLM_ASCEND_VERIFY_KV_BEFORE_PULL
+        self.verify_stats = {"valid": 0, "expired": 0, "timeout": 0}
+        self.verify_stats_lock = threading.Lock()
+        self._last_verify_summary_time = time.time()
+        self.verify_resp_decoder = msgspec.msgpack.Decoder(type=tuple)
+
         assert vllm_config is not None
         self.vllm_config: VllmConfig = vllm_config
         self.model_config = self.vllm_config.model_config
@@ -1538,6 +1546,76 @@ class KVCacheRecvingThread(threading.Thread):
         remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
         with self.remote_sockets_lock:
             self.remote_sockets[remote_path].append(sock)
+
+    def _record_verify_stat(self, result: str) -> None:
+        with self.verify_stats_lock:
+            self.verify_stats[result] += 1
+            now = time.time()
+            elapsed = now - self._last_verify_summary_time
+            if elapsed >= VERIFY_STATS_SUMMARY_INTERVAL_SECONDS:
+                logger.info(
+                    "KV verify stats (last %.0fs): valid=%d, expired=%d, timeout=%d. "
+                    "timeout may indicate an older P version or network issues.",
+                    elapsed,
+                    self.verify_stats["valid"],
+                    self.verify_stats["expired"],
+                    self.verify_stats["timeout"],
+                )
+                self._last_verify_summary_time = now
+                for key in self.verify_stats:
+                    self.verify_stats[key] = 0
+
+    def _verify_remote_blocks_held(self, req_meta: dict[str, Any]) -> bool:
+        """Ask P whether the remote blocks for this request are still held.
+
+        Returns False on EXPIRED or on any failure (timeout/protocol error):
+        conservative — the pull is skipped and the request recomputes. A
+        well-formed exchange returns the pooled socket; a failed one closes it
+        (a timed-out REQ socket must never be reused, its late reply would
+        corrupt the next exchange).
+        """
+        remote_request_id = req_meta["remote_request_id"]
+        remote_host = req_meta["remote_host"]
+        remote_handshake_port = req_meta["remote_handshake_port"]
+        target = f"{remote_host}:{remote_handshake_port}"
+        sock: zmq.Socket | None = None
+        reusable = False
+        try:
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            payload = self.encoder.encode((VERIFY_REQ_MSG, remote_request_id))
+            ensure_zmq_send(sock, payload, target)
+            resp = ensure_zmq_recv(sock, target)
+            decoded = self.verify_resp_decoder.decode(resp)
+            reusable = True
+            if len(decoded) == 2 and decoded[0] == VERIFY_RESP_MSG and decoded[1] == VERIFY_STATUS_VALID:
+                self._record_verify_stat("valid")
+                logger.debug("KV verify passed for request %s at %s.", remote_request_id, target)
+                return True
+            self._record_verify_stat("expired")
+            logger.warning(
+                "Remote KV blocks expired on P side, skipping pull. "
+                "remote_request_id=%s, source=%s.",
+                remote_request_id,
+                target,
+            )
+            return False
+        except Exception as e:
+            self._record_verify_stat("timeout")
+            logger.warning(
+                "KV verify failed, treating as expired and skipping pull. This may be "
+                "caused by an older P node version or a network issue. "
+                "remote_request_id=%s, source=%s, error=%s.",
+                remote_request_id,
+                target,
+                e,
+            )
+            return False
+        finally:
+            if sock is not None:
+                if reusable:
+                    self._return_remote_socket(sock, remote_host, remote_handshake_port)
+                else:
+                    sock.close()
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):

@@ -3365,6 +3365,109 @@ class TestVerifyReq(unittest.TestCase):
         finally:
             sock.close()
 
+    def _make_recv_thread(self, env_value: str = "1") -> KVCacheRecvingThread:
+        with patch.dict(os.environ, {"VLLM_ASCEND_VERIFY_KV_BEFORE_PULL": env_value}):
+            thread = KVCacheRecvingThread(
+                tp_rank=0,
+                tp_size=4,
+                _prefill_pp_size=1,
+                engine=MagicMock(),
+                local_engine_id="local_engine",
+                local_handshake_port=5555,
+                side_channel_port=30000,
+                local_kv_caches_base_addr=[[0x1000], [0x2000]],
+                block_len_per_addr=[[1024], [2048]],
+                block_stride_per_addr=[[1024], [2048]],
+                ready_event=threading.Event(),
+                vllm_config=MockVllmConfig(),
+                kv_caches={},
+                prefill_pp_layer_partition=None,
+            )
+        thread.remote_sockets = defaultdict(deque)
+        return thread
+
+    def _make_req_meta(self):
+        return {
+            "request_id": "d_req_1",
+            "remote_request_id": "p_req_1",
+            "local_block_ids": [[101, 102]],
+            "remote_block_ids": [[201, 202]],
+            "local_block_ids_replicate_k": tuple(),
+            "remote_block_ids_replicate_k": tuple(),
+            "group_pulls": [],
+            "remote_engine_id": "remote_engine",
+            "remote_host": "10.0.0.1",
+            "remote_handshake_port": 7777,
+            "num_computed_tokens": 0,
+            "remote_port_send_num": {},
+            "all_task_done": True,
+            "shard_idx": 0,
+            "remote_block_size": None,
+        }
+
+    def test_verify_disabled_by_default(self):
+        thread = self._make_recv_thread(env_value="0")
+        self.assertFalse(thread.verify_before_pull_enabled)
+
+    def test_verify_enabled_via_env(self):
+        thread = self._make_recv_thread(env_value="1")
+        self.assertTrue(thread.verify_before_pull_enabled)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
+    def test_verify_remote_blocks_held_valid(self, mock_send, mock_recv):
+        thread = self._make_recv_thread()
+        mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_VALID))
+        self.assertTrue(thread._verify_remote_blocks_held(self._make_req_meta()))
+        self.assertEqual(thread.verify_stats["valid"], 1)
+        mock_send.assert_called_once()
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
+    def test_verify_remote_blocks_held_expired(self, mock_send, mock_recv):
+        thread = self._make_recv_thread()
+        mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_EXPIRED))
+        self.assertFalse(thread._verify_remote_blocks_held(self._make_req_meta()))
+        self.assertEqual(thread.verify_stats["expired"], 1)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
+    def test_verify_remote_blocks_held_timeout(self, mock_send, mock_recv):
+        thread = self._make_recv_thread()
+        mock_recv.side_effect = RuntimeError("Failed to receive data after 3 retries")
+        self.assertFalse(thread._verify_remote_blocks_held(self._make_req_meta()))
+        self.assertEqual(thread.verify_stats["timeout"], 1)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
+    def test_verify_error_closes_socket_not_returned(self, mock_send, mock_recv):
+        thread = self._make_recv_thread()
+        mock_sock = MagicMock()
+        with patch.object(thread, "_get_remote_socket", return_value=mock_sock):
+            mock_recv.side_effect = RuntimeError("boom")
+            self.assertFalse(thread._verify_remote_blocks_held(self._make_req_meta()))
+        mock_sock.close.assert_called_once()
+        target_path = make_zmq_path("tcp", "10.0.0.1", 7777)
+        self.assertEqual(len(thread.remote_sockets[target_path]), 0)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
+    @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
+    def test_verify_success_returns_socket_to_pool(self, mock_send, mock_recv):
+        thread = self._make_recv_thread()
+        mock_sock = MagicMock()
+        with patch.object(thread, "_get_remote_socket", return_value=mock_sock):
+            mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_VALID))
+            self.assertTrue(thread._verify_remote_blocks_held(self._make_req_meta()))
+        mock_sock.close.assert_not_called()
+        target_path = make_zmq_path("tcp", "10.0.0.1", 7777)
+        self.assertEqual(len(thread.remote_sockets[target_path]), 1)
+
+    def test_verify_counters_summary(self):
+        thread = self._make_recv_thread()
+        with patch.object(thread, "_record_verify_stat") as mock_record:
+            thread._record_verify_stat("valid")
+        mock_record.assert_called_once_with("valid")
+
 
 if __name__ == "__main__":
     unittest.main()
