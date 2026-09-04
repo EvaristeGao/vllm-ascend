@@ -127,6 +127,8 @@ sequenceDiagram
   无脏读可能，自然跳过 verify，不多付一次 RTT；
 - 校验失败 `raise KVCacheVerifyExpiredError`，落入现有 `except Exception` → `transfer_failed = True` →
   `_mark_failed_recv_request(...)`——与传输失败逐字复用同一条清理路径，不新增分支、不复制零块判断逻辑；
+  （实现评审裁定：except 内对日志函数做 isinstance 特判——`KVCacheVerifyExpiredError` 记 WARNING 无栈
+  （预期恢复路径，积压场景高频），其他异常保持 `logger.exception`；清理路径逻辑零变化）
 - 专用异常类型使日志与测试可区分"P 侧已过期"与"传输异常"。
 - 一次请求的全部 RDMA read 发往同一个 P 端点 session（`session_id = remote_host:remote_transfer_port`，
   一次 `batch_transfer_sync_read`，L962；已核实），verify 发往 `req_meta` 的
@@ -192,6 +194,10 @@ NPU 侧 `NPUModelRunner(GPUModelRunner)` 继承链使用该 mixin，传播链在
 
 验收线：以上用例全绿 + `tests/ut/kv_offload/` 现有用例不回归。
 
+测试惯例注记（实现期实证）：本 connector 的 logger 是 vllm 共享 logger（`from vllm.logger import logger`，
+实际名 `"vllm.logger"`、传播至 `"vllm"`）——`assertLogs` 目标应为 `"vllm"`（仓库惯例，见
+`tests/ut/test_platform.py`），模块 `__name__` 路径的 logger 永不触发。
+
 ## 9. 边界情况
 
 | 场景 | 行为 |
@@ -239,9 +245,10 @@ Hybrid 同构复用是搬运而非重设计，单测直进 `TestKVCacheTaskTrack
 ## 附录 A：E2E 验证手册（真实 PD 集群，非本次验收线）
 
 1. **复现 bug**（开关关闭）：`VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=10`，P/D 加压使 D 侧请求排队超过 10s，
-   观察输出乱码 + P 侧 `Force freed expired request` + D 侧 `finish req not in reqs to process`。
+   观察输出乱码 + P 侧 `Force freed expired request`（ERROR）。注：D 侧 `finish req not in reqs to process`
+   已降噪为 debug（迟到 DONE 属预期路径），不再作为复现判据，以 P 侧 ERROR 与乱码为准。
 2. **验证修复**（开关开启）：同上参数，预期 D 侧出现
-   `KVCacheVerifyExpiredError` / EXPIRED warning，scheduler 日志出现
+   `KVCacheVerifyExpiredError` / EXPIRED warning（WARNING 级、无栈），scheduler 日志出现
    `Recovered from KV load failure: N request(s) rescheduled`，请求重算后输出正常，无乱码。
 3. **判定标准**：乱码率降为 0；重算请求数与 D 侧排队超时请求数一致；P 侧无新增内存泄漏（blocks 仍按时释放）。
 
