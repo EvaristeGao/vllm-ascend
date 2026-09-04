@@ -795,7 +795,11 @@ class KVCacheRecvingThread(threading.Thread):
                 except Exception as e:
                     transfer_failed = True
                     self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
-                    logger.exception("Failed to transfer KV cache for request %s: %s", remote_request_id, e)
+                    # KVCacheVerifyExpiredError is an expected recovery path
+                    # (backlog after P-side timeout) — warn without a stack
+                    # instead of spamming ERROR+traceback per recompute.
+                    log = logger.warning if isinstance(e, KVCacheVerifyExpiredError) else logger.exception
+                    log("Failed to transfer KV cache for request %s: %s", remote_request_id, e)
         finally:
             all_tasks_done = self._mark_request_task_done(request_id, all_task_done)
             if all_tasks_done:
