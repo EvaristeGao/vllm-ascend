@@ -3196,6 +3196,12 @@ class TestVerifyReq(unittest.TestCase):
         with patch.dict(os.environ, {"VLLM_ASCEND_VERIFY_KV_BEFORE_PULL": "0"}):
             self.assertFalse(ascend_envs.VLLM_ASCEND_VERIFY_KV_BEFORE_PULL)
 
+    def test_verify_env_default_when_unset(self):
+        env = dict(os.environ)
+        env.pop("VLLM_ASCEND_VERIFY_KV_BEFORE_PULL", None)
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(ascend_envs.VLLM_ASCEND_VERIFY_KV_BEFORE_PULL)
+
     def test_env_switch_enable(self):
         with patch.dict(os.environ, {"VLLM_ASCEND_VERIFY_KV_BEFORE_PULL": "1"}):
             self.assertTrue(ascend_envs.VLLM_ASCEND_VERIFY_KV_BEFORE_PULL)
@@ -3417,25 +3423,37 @@ class TestVerifyReq(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
     def test_verify_remote_blocks_held_valid(self, mock_send, mock_recv):
         thread = self._make_recv_thread()
-        mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_VALID))
-        self.assertTrue(thread._verify_remote_blocks_held(self._make_req_meta()))
+        mock_sock = MagicMock()
+        # patch 掉真实 socket 创建：泄露的真实 zmq Context 在 GC 时 ctx.term()
+        # 可能阻塞整个 UT 进程（等待未关闭 socket 的后台线程）
+        with patch.object(thread, "_get_remote_socket", return_value=mock_sock):
+            mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_VALID))
+            self.assertTrue(thread._verify_remote_blocks_held(self._make_req_meta()))
         self.assertEqual(thread.verify_stats["valid"], 1)
         mock_send.assert_called_once()
+        # 成功路径：socket 归还池中而非关闭（同 test_verify_success_returns_socket_to_pool）
+        mock_sock.close.assert_not_called()
+        target_path = make_zmq_path("tcp", "10.0.0.1", 7777)
+        self.assertEqual(len(thread.remote_sockets[target_path]), 1)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
     def test_verify_remote_blocks_held_expired(self, mock_send, mock_recv):
         thread = self._make_recv_thread()
-        mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_EXPIRED))
-        self.assertFalse(thread._verify_remote_blocks_held(self._make_req_meta()))
+        mock_sock = MagicMock()
+        with patch.object(thread, "_get_remote_socket", return_value=mock_sock):
+            mock_recv.return_value = thread.encoder.encode((VERIFY_RESP_MSG, VERIFY_STATUS_EXPIRED))
+            self.assertFalse(thread._verify_remote_blocks_held(self._make_req_meta()))
         self.assertEqual(thread.verify_stats["expired"], 1)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_send")
     def test_verify_remote_blocks_held_timeout(self, mock_send, mock_recv):
         thread = self._make_recv_thread()
-        mock_recv.side_effect = RuntimeError("Failed to receive data after 3 retries")
-        self.assertFalse(thread._verify_remote_blocks_held(self._make_req_meta()))
+        mock_sock = MagicMock()
+        with patch.object(thread, "_get_remote_socket", return_value=mock_sock):
+            mock_recv.side_effect = RuntimeError("Failed to receive data after 3 retries")
+            self.assertFalse(thread._verify_remote_blocks_held(self._make_req_meta()))
         self.assertEqual(thread.verify_stats["timeout"], 1)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.ensure_zmq_recv")
@@ -3534,19 +3552,28 @@ class TestVerifyReq(unittest.TestCase):
         thread.engine.batch_transfer_sync_read.assert_not_called()
 
     def test_zmq_verify_roundtrip_end_to_end(self):
-        thread_p, _unused_sock, actual_port = self._start_sending_thread()
+        thread_p, d_sock, actual_port = self._start_sending_thread()
         thread_p.task_tracker.add_req_to_process("p_req_live")
         thread_p.task_tracker.add_delayed_request("p_req_live", time.time())
         thread_d = self._make_recv_thread()
-        for transfer_id, expect_held in (("p_req_live", True), ("p_req_gone", False)):
-            req_meta = self._make_req_meta()
-            req_meta["remote_request_id"] = transfer_id
-            req_meta["remote_host"] = "127.0.0.1"
-            req_meta["remote_handshake_port"] = actual_port
-            held = thread_d._verify_remote_blocks_held(req_meta)
-            self.assertEqual(held, expect_held)
-        self.assertEqual(thread_d.verify_stats["valid"], 1)
-        self.assertEqual(thread_d.verify_stats["expired"], 1)
+        try:
+            for transfer_id, expect_held in (("p_req_live", True), ("p_req_gone", False)):
+                req_meta = self._make_req_meta()
+                req_meta["remote_request_id"] = transfer_id
+                req_meta["remote_host"] = "127.0.0.1"
+                req_meta["remote_handshake_port"] = actual_port
+                held = thread_d._verify_remote_blocks_held(req_meta)
+                self.assertEqual(held, expect_held)
+            self.assertEqual(thread_d.verify_stats["valid"], 1)
+            self.assertEqual(thread_d.verify_stats["expired"], 1)
+        finally:
+            # 显式清理：D 侧用过的真实 REQ socket 已归还池中，取出并 close，
+            # 否则其独立 zmq Context 在 GC 析构 ctx.term() 时可能阻塞整个
+            # UT 进程。P 侧线程为 daemon，维持既有口径由进程退出回收。
+            pooled = thread_d.remote_sockets[make_zmq_path("tcp", "127.0.0.1", actual_port)]
+            while pooled:
+                pooled.popleft().close()
+            d_sock.close()
 
 
 if __name__ == "__main__":
