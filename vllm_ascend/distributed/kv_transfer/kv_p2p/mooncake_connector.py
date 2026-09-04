@@ -259,9 +259,7 @@ class KVCacheTaskTracker:
             if request_id not in self.reqs_to_process:
                 return False
             if request_id in self.delayed_free_requests:
-                deadline_floor = time.time() - (
-                    envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT - VERIFY_GRACE_SECONDS
-                )
+                deadline_floor = time.time() - (envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT - VERIFY_GRACE_SECONDS)
                 if deadline_floor > self.delayed_free_requests[request_id]:
                     self.delayed_free_requests[request_id] = deadline_floor
             return True
@@ -441,9 +439,7 @@ class KVCacheSendingThread(threading.Thread):
                     # through check_and_extend under done_task_lock.
                     if len(msg) != 2 or not isinstance(msg[1], str):
                         logger.error(
-                            "Invalid VERIFY_REQ_MSG payload. "
-                            "Expected: (VERIFY_REQ_MSG, str transfer_id). "
-                            "Actual: %s.",
+                            "Invalid VERIFY_REQ_MSG payload. Expected: (VERIFY_REQ_MSG, str transfer_id). Actual: %s.",
                             msg,
                         )
                     else:
@@ -1604,8 +1600,7 @@ class KVCacheRecvingThread(threading.Thread):
                 return True
             self._record_verify_stat("expired")
             logger.warning(
-                "Remote KV blocks expired on P side, skipping pull. "
-                "remote_request_id=%s, source=%s.",
+                "Remote KV blocks expired on P side, skipping pull. remote_request_id=%s, source=%s.",
                 remote_request_id,
                 target,
             )

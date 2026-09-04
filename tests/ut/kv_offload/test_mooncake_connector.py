@@ -3502,9 +3502,11 @@ class TestVerifyReq(unittest.TestCase):
     def test_transfer_verify_expired_skips_engine_read(self):
         thread = self._make_recv_thread()
         self._prepare_remote_metadata(thread)
-        with patch.object(thread, "_verify_remote_blocks_held", return_value=False):
-            with self.assertRaises(KVCacheVerifyExpiredError):
-                thread._transfer_kv_cache_all_groups(self._make_req_meta())
+        with (
+            patch.object(thread, "_verify_remote_blocks_held", return_value=False),
+            self.assertRaises(KVCacheVerifyExpiredError),
+        ):
+            thread._transfer_kv_cache_all_groups(self._make_req_meta())
         thread.engine.batch_transfer_sync_read.assert_not_called()
 
     def test_transfer_verify_enabled_skips_when_zero_blocks(self):
